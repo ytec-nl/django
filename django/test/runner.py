@@ -1,5 +1,4 @@
 import argparse
-import ctypes
 import faulthandler
 import io
 import itertools
@@ -7,7 +6,9 @@ import logging
 import multiprocessing
 import os
 import pickle
+import queue
 import random
+import signal
 import sys
 import textwrap
 import unittest
@@ -367,10 +368,7 @@ def parallel_type(value):
         )
 
 
-_worker_id = 0
-
-
-def _init_worker(counter):
+def _init_worker(available_worker_ids, master_pid):
     """
     Switch to databases dedicated to this worker.
 
@@ -378,15 +376,19 @@ def _init_worker(counter):
     requirements.
     """
 
-    global _worker_id
-
-    with counter.get_lock():
-        counter.value += 1
-        _worker_id = counter.value
+    try:
+        worker_id = available_worker_ids.get(timeout=1)
+    except queue.Empty:
+        # it's possible a sibling already sent the signal
+        try:
+            os.kill(master_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise RuntimeError("There were no more parallel test DBs to use; did a runner crash in the background?")
 
     for alias in connections:
         connection = connections[alias]
-        settings_dict = connection.creation.get_test_db_clone_settings(str(_worker_id))
+        settings_dict = connection.creation.get_test_db_clone_settings(worker_id)
         # connection.settings_dict must be updated in place for changes to be
         # reflected in django.db.connections. If the following line assigned
         # connection.settings_dict = settings_dict, new threads would connect
@@ -429,9 +431,10 @@ class ParallelTestSuite(unittest.TestSuite):
     run_subsuite = _run_subsuite
     runner_class = RemoteTestRunner
 
-    def __init__(self, subsuites, processes, failfast=False, buffer=False):
+    def __init__(self, subsuites, processes, worker_ids, failfast=False, buffer=False):
         self.subsuites = subsuites
         self.processes = processes
+        self.worker_ids = worker_ids
         self.failfast = failfast
         self.buffer = buffer
         super().__init__()
@@ -451,11 +454,11 @@ class ParallelTestSuite(unittest.TestSuite):
         Even with tblib, errors may still occur for dynamically created
         exception classes which cannot be unpickled.
         """
-        counter = multiprocessing.Value(ctypes.c_int, 0)
+        master_pid = os.getpid()
         pool = multiprocessing.Pool(
             processes=self.processes,
             initializer=self.init_worker.__func__,
-            initargs=[counter],
+            initargs=[self.worker_ids, master_pid],
         )
         args = [
             (self.runner_class, index, subsuite, self.failfast, self.buffer)
@@ -578,6 +581,7 @@ class DiscoverRunner:
         self.debug_mode = debug_mode
         self.debug_sql = debug_sql
         self.parallel = parallel
+        self.parallel_worker_ids = multiprocessing.Queue()
         self.tags = set(tags or [])
         self.exclude_tags = set(exclude_tags or [])
         if not faulthandler.is_enabled() and enable_faulthandler:
@@ -821,16 +825,20 @@ class DiscoverRunner:
                 suite = self.parallel_test_suite(
                     subsuites,
                     processes,
+                    self.parallel_worker_ids,
                     self.failfast,
                     self.buffer,
                 )
         return suite
 
     def setup_databases(self, **kwargs):
-        return _setup_databases(
+        old_names, parallel_suffixes = _setup_databases(
             self.verbosity, self.interactive, time_keeper=self.time_keeper, keepdb=self.keepdb,
-            debug_sql=self.debug_sql, parallel=self.parallel, **kwargs
+            debug_sql=self.debug_sql, parallel=self.parallel, also_return_parallel_info=True, **kwargs
         )
+        for suffix in parallel_suffixes:
+            self.parallel_worker_ids.put(suffix)
+        return old_names
 
     def get_resultclass(self):
         if self.debug_sql:
