@@ -167,6 +167,7 @@ def setup_databases(
     parallel=0,
     aliases=None,
     serialized_aliases=None,
+    also_return_parallel_info=False,
     **kwargs,
 ):
     """Create the test databases."""
@@ -176,6 +177,7 @@ def setup_databases(
     test_databases, mirrored_aliases = get_unique_databases_and_mirrors(aliases)
 
     old_names = []
+    parallel_suffixes = []
 
     for db_name, aliases in test_databases.values():
         first_alias = None
@@ -214,11 +216,13 @@ def setup_databases(
                 if parallel > 1:
                     for index in range(parallel):
                         with time_keeper.timed("  Cloning '%s'" % alias):
+                            suffix = str(index + 9001)
                             connection.creation.clone_test_db(
-                                suffix=str(index + 1),
+                                suffix=suffix,
                                 verbosity=verbosity,
                                 keepdb=keepdb,
                             )
+                            parallel_suffixes.append(suffix)
             # Configure all other connections as mirrors of the first one
             else:
                 connections[alias].creation.set_as_test_mirror(connections[first_alias].settings_dict)
@@ -232,6 +236,8 @@ def setup_databases(
         for alias in connections:
             connections[alias].force_debug_cursor = True
 
+    if also_return_parallel_info:
+        return old_names, parallel_suffixes
     return old_names
 
 
